@@ -1,0 +1,906 @@
+/*
+ *  audioengine
+ *  ip/opus crypto phone
+ *
+ *  Copyright (C) 2013 Trevoc Ltd.
+ *   
+ */
+
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <sys/stat.h>
+#include <signal.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <error.h>
+#include <errno.h>
+#include <string.h>
+#include <alsa/asoundlib.h>
+#include <linux/limits.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
+
+char peer[64];
+char role[16];
+char capabilities[32];
+char port[8];
+char format[16];
+char channels[8];
+char rate[16];
+char bits[8];
+char codec[16];
+char buffersize[16];
+char proto[8];
+char savefiledir[PATH_MAX];
+char savefileduration[8];
+char title3timeout[8];
+int _savefileduration;
+int _title3timeout;
+int _saving;
+
+char opusbitrate[8];
+char opusframesize[8];
+char opusendianness[8];
+char opuscomp[8];
+char opusexpectloss[8];
+char saveropusbitrate[8];
+char saveropusframesize[8];
+char saveropusendianness[8];
+char saveropuscomp[8];
+char saveropusexpectloss[8];
+char loopback[16];
+int _loopback;
+char use_ssl[16];
+int _use_ssl;
+char certfile[PATH_MAX];
+char keyfile[PATH_MAX];
+char cafile[PATH_MAX];
+
+int loopbackpipe[2];
+int playerpipe[2];
+int recorderpipe[2];
+
+fd_set active_ips, active_ops;
+volatile pid_t playstream_pid = -1;
+volatile pid_t recordstream_pid = -1;
+volatile pid_t encoder2_pid = -1;
+int ctrlfifo_in, ctrlfifo_out;
+
+typedef enum _engine_action_t {
+  engine_action_none,
+  engine_action_call,
+  engine_action_answer,
+  engine_action_hangup,
+  engine_action_hello,
+  engine_action_incoming_call,
+  engine_action_calling,
+  engine_action_established,
+} engine_action_t;
+
+typedef enum _engine_state_t {
+  engine_state_idle,
+  engine_state_caller_pre_handshake,
+  engine_state_callee_pre_handshake,
+  engine_state_calling,
+  engine_state_ringing,
+  engine_state_established,
+} engine_state_t;
+
+engine_state_t engine_state = engine_state_idle;
+
+int streamfd = -1;  
+int streamlistener = -1;
+int saverenc_fds[2];
+
+time_t mute_start;
+int savefd = -1;
+time_t save_start;
+
+int force_sink;
+char saveonly[8];
+int _saveonly;
+
+#define INFIFO "/tmp/aefifo_in"
+#define OUTFIFO "/tmp/aefifo_out"
+char audioengine_reply_hello[]            = { "audioengine version 0.1 ready\n" };
+char audioengine_reply_hangup[]           = { "hangup\n" };
+char audioengine_reply_incoming_call[]    = { "ring ring...\n" };
+char audioengine_reply_calling[]          = { "calling...\n" };
+char audioengine_reply_call_established[] = { "call established\n" };
+
+#define CONF_FILE_NAME "/etc/audiopipe.conf"
+char conffilename[PATH_MAX] = { CONF_FILE_NAME };
+
+#define AUDIOPIPE_PID_FILE_NAME "/tmp/audiopipe.pid"
+#define CHUNK_SIZE 4096
+
+extern char *net_get_caller_id(void);
+extern char *net_get_cipher(void);
+extern void net_hangup(void);
+
+static pid_t fork_encoder(int fd_in, int fd_out, int issaver);
+static void do_hangup(void);
+static void accept_stream(void);
+static void launch_stream(void);
+static void answer_call(void);
+/* Title3 support */
+static int should_mute(void) 
+{
+
+  if (mute_start) {
+    time_t now = time(NULL);
+    if (now - mute_start < _title3timeout) 
+      return 1;
+    
+    mute_start = 0;    
+  }
+  
+  return 0;
+}
+
+static void create_save_file(void)
+{
+  char tmp[PATH_MAX];
+  char datestr[32];
+
+  mkdir(savefiledir, S_IRUSR|S_IWUSR |S_IXUSR);
+  strcpy(tmp, savefiledir);
+  strcat(tmp, "/");
+
+  time_t now = time(NULL);
+
+  struct tm *tm = gmtime(&now);
+  sprintf(datestr, "%d%02d%02d%02d%02d%02d", tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday, tm->tm_hour, tm->tm_min, tm->tm_sec);
+
+  strcat(tmp, datestr);
+  strcat(tmp, ".opus");
+  savefd = open(tmp, O_CREAT|O_RDWR, S_IRUSR|S_IWUSR);
+  if (savefd < 0)
+    perror("could not create file for stream saving.");
+  save_start = now;
+}
+
+static void close_save_file(void)
+{
+  close(savefd);
+  savefd = -1;
+}
+
+static void write_save_file(const char *ptr, int n)
+{
+  time_t now;
+
+  pid_t tmp;
+
+  if (savefd < 0)
+    create_save_file();
+    
+  if (savefd < 0)
+    return;
+
+  now = time(NULL);
+  
+  if (now - save_start > _savefileduration) {
+    close_save_file();
+
+    if ((tmp=encoder2_pid) > 0) {
+      kill(tmp, SIGKILL);
+      waitpid(tmp, NULL, 0); 
+      encoder2_pid = fork_encoder(saverenc_fds[0], saverenc_fds[1], 1);
+    }
+  }
+  write(savefd, ptr, n);
+}
+
+static void report_pid(void) 
+{
+  pid_t mypid = getpid();
+  char buf[16];
+  
+  sprintf(buf, "%d\n", mypid);
+  int fd = open(AUDIOPIPE_PID_FILE_NAME, O_CREAT|O_RDWR|O_TRUNC, S_IRUSR|S_IWUSR);
+  write(fd, buf, strlen(buf));
+  close(fd);
+}
+
+static char httpline[]="HTTP/1.1 200 OK\r\n";
+static char contenttypeline[]="Content-Type: audio/ogg\r\n\r\n";
+
+static void write_http_headers(int fd) 
+{
+  send(fd, httpline, strlen(httpline), MSG_NOSIGNAL);
+  send(fd, contenttypeline, strlen(contenttypeline), MSG_NOSIGNAL);
+
+}
+
+static void audio_source(int upstream_fd)
+{
+    if (!strcmp(codec, "opus")) 
+      opusenc(format, atoi(buffersize), atoi(bits), atoi(channels), atoi(rate), atoi(opusendianness), atoi(opusbitrate), opusframesize, atoi(opuscomp), upstream_fd);
+    
+    exit(0);
+}
+
+static void audio_sink(int upstream_fd)
+{
+
+    if (!strcmp(codec, "opus")) 
+      opusdec(format, atoi(buffersize), atoi(bits), atoi(channels), atoi(rate), upstream_fd);     
+    exit(0);
+}
+
+static int parse_conf_opt(char *buf, char *option, char *value) 
+{
+  char *ptr, *ptr2, *tmp;
+  int n;
+  char fmt[256];
+
+  strcpy(fmt, option);
+  strcat(fmt, " = %s");
+
+  char *line = strtok((tmp=strdup(buf)), "\n");
+  while (line) {
+
+    ptr  = strstr(line, option);
+    ptr2 = strstr(line, "#");
+
+    if (ptr && ptr2 && ptr2 < ptr) 
+      goto next_line;
+    
+    if (ptr) {      
+      n = sscanf(ptr, fmt, value);
+      if (n == 1) {
+	free(tmp);
+	return 1;
+      }
+    }
+  next_line: 
+    line  = strtok(NULL, "\n");
+  }
+  
+  free(tmp);
+  return 0;
+}
+
+struct conf_opt {
+  char *name;
+  char *value;
+  char *def;
+};
+
+static struct conf_opt conf_opts[] = {
+  { "role", role, "" },
+  { "capabilities", capabilities, "" },
+  { "peer", peer, "" },
+  { "port", port, "5858" },
+  { "proto", proto, "tcp" },
+  { "format", format, "S16_BE" },
+  { "channels", channels, "2" },
+  { "rate", rate, "48000" },
+  { "codec", codec, "opus" },
+  { "buffersize", buffersize, "65536" },
+  { "savefiledir", savefiledir, "" },
+  { "savefileduration", savefileduration, "1800" },
+  { "title3timeout", title3timeout, "30" },
+  { "saveonly", saveonly, "false" },
+  { "opusbitrate", opusbitrate, "16" },
+  { "opusframesize", opusframesize, "20" },
+  { "opusendianness", opusendianness, "1" },
+  { "opuscomp", opuscomp, "1" },
+  { "opusexpectloss", opusexpectloss, "0" },
+  { "saveropusbitrate", saveropusbitrate, "16" },
+  { "saveropusframesize", saveropusframesize, "20" },
+  { "saveropusendianness", saveropusendianness, "1" },
+  { "saveropuscomp", saveropuscomp, "1" },
+  { "saveropusexpectloss", saveropusexpectloss, "0" },
+  { "loopback", loopback, "false" },
+  { "ssl", use_ssl, "false" },
+  { "certfile", certfile, "" },
+  { "keyfile", keyfile, "" },
+  { "cafile", cafile, "" },
+
+};
+
+static void parse_conf(void)
+{
+  size_t i;
+  int fd = open(conffilename, O_RDONLY);
+  if (fd < 0)
+    return;
+
+  off_t length = lseek(fd, 0, SEEK_END);
+  lseek(fd, 0, SEEK_SET);
+
+  char *buf = malloc(length+1);
+  if (!buf) {
+    close(fd);
+    return;
+  }
+
+  buf[length] = 0;
+  read(fd, buf, length);
+  close(fd);
+
+  for (i=0; i < (sizeof(conf_opts) / sizeof (conf_opts[0])); i++) {
+    strcpy(conf_opts[i].value, conf_opts[i].def);
+    parse_conf_opt(buf, conf_opts[i].name, conf_opts[i].value);
+    printf("%s = %s\n", conf_opts[i].name, conf_opts[i].value);
+
+  }
+
+  _savefileduration = atoi(savefileduration);
+  _title3timeout = atoi(title3timeout);
+  _saveonly = !strcmp(saveonly, "true");
+
+  if (strstr(format, "BE")) {
+    strcpy(opusendianness, "1");
+    strcpy(saveropusendianness, "1");
+  }
+  else { 
+    strcpy(opusendianness, "0");
+    strcpy(saveropusendianness, "0");
+  }
+
+  if (strstr(format, "16"))
+    strcpy(bits, "16");
+  else
+    strcpy(bits, "8");
+  printf("bits = %s\n", bits);  
+
+  if (strlen(savefiledir)) 
+    _saving = 1;
+  else
+    _saving = 0;
+
+  if (!_saving)
+    _saveonly = 0;
+
+  _loopback = !(strcmp(loopback, "true"));
+
+  _use_ssl = !strcmp(use_ssl, "true");
+
+  // TODO compatible with old behaviour
+  if (!strlen(role)) {
+    printf("audioengine: backward compatiblity :\n");
+    if (force_sink || !strlen(peer)) {
+      strcpy(role, "target");
+      strcpy(capabilities, "play");
+      printf(" assuming role='target' and capabilites='play'\n");
+    }
+    else {
+      strcpy(role, "initiator");
+      strcpy(capabilities, "record");
+      printf(" assuming role='initiator' and capabilites='record'\n");
+    }
+  }
+
+  free(buf);  
+}
+
+
+static void sigchld_hdl(int sig)
+{
+
+  pid_t pid;
+
+  while ((pid = waitpid(-1, NULL, WNOHANG)) > 0) {
+    
+    if (pid == playstream_pid) {
+      printf("...caught player subsystem death signal\n");
+      playstream_pid = -1;
+    }
+    if (pid == recordstream_pid) {
+      printf("...caught recorder subsystem  death signal\n");
+      recordstream_pid = -1;
+    }
+  }
+}
+
+/*
+ * SIGUSR1 is used to signal the mute period (title3)
+ */
+static void sigusr1_hdl (int sig)
+{
+  mute_start = time(NULL);
+}
+ 
+static void parse_args(int argc, char **argv)
+{
+
+  int i;
+
+  for(i=1; i < argc; i++) {
+    if(!strcmp(argv[i], "--sink"))
+      force_sink = 1;
+
+    if (!strcmp(argv[i], "-f") && i+1 < argc)
+      strcpy(conffilename, argv[i+1]);
+  }
+}
+
+static void setup_signals(void)
+{
+  struct sigaction act;   
+  memset (&act, 0, sizeof(act));
+  act.sa_handler = sigchld_hdl;
+  act.sa_flags = SA_RESTART;
+  
+  if (sigaction(SIGCHLD, &act, 0)) {
+    perror ("sigaction - SIGCHLD");
+    exit(1);
+  }
+
+  memset (&act, 0, sizeof(act));
+  act.sa_handler = sigusr1_hdl;
+  act.sa_flags = SA_RESTART;
+  
+  if (sigaction(SIGUSR1, &act, 0)) {
+    perror ("sigaction - SIGUSR1");
+    exit(1);
+  }
+
+}
+
+static void fork_player_subsystem(int fd) 
+{
+
+  playstream_pid = fork();
+
+  if (playstream_pid < 0)
+    error(1, errno, "Could not fork playstream");
+          
+  if (playstream_pid)
+    return;
+
+  setup_signals();
+  audio_sink(fd);
+  exit(0);
+
+}
+
+static void  fork_recorder_subsystem(int fd) 
+{
+  recordstream_pid = fork();
+
+  if (recordstream_pid < 0)
+    error(1, errno, "Could not fork recordstream");
+          
+  if (recordstream_pid)
+    return;
+
+  setup_signals();
+  audio_source(fd);
+  exit(0);
+}
+
+void fifo_command_send_reply(engine_action_t action)
+{
+
+  char tmp[256];
+  switch (action) {
+  case engine_action_hangup:
+    write(ctrlfifo_out, audioengine_reply_hangup, strlen(audioengine_reply_hangup));
+    break;
+  case engine_action_established:
+    if (!_use_ssl)
+      write(ctrlfifo_out, audioengine_reply_call_established, strlen(audioengine_reply_call_established));
+    else {
+      strcpy(tmp, "Call established with\n");
+      strcat(tmp, net_get_caller_id());
+      strcat(tmp, "\n");
+      write(ctrlfifo_out, tmp, strlen(tmp));
+
+    }
+    break;
+
+  case engine_action_hello:   
+    write(ctrlfifo_out, audioengine_reply_hello, strlen(audioengine_reply_hello));       
+    break;
+  
+  case engine_action_incoming_call:
+    if (!_use_ssl)
+      write(ctrlfifo_out, audioengine_reply_incoming_call, strlen(audioengine_reply_incoming_call));    
+    else {
+      strcpy(tmp, net_get_caller_id());
+      strcat(tmp, "\nis calling...\ncipher: ");
+      strcat(tmp, net_get_cipher());
+      strcat(tmp, "\n");
+      write(ctrlfifo_out, tmp, strlen(tmp));
+    }
+    break;
+
+  case engine_action_calling:
+    if (!_use_ssl)
+      write(ctrlfifo_out, audioengine_reply_calling, strlen(audioengine_reply_calling));
+    else {
+      strcpy(tmp, "calling\n");
+      strcat(tmp, net_get_caller_id());
+      strcat(tmp, " ...\ncipher: ");
+      strcat(tmp, net_get_cipher());
+      strcat(tmp, "\n");
+      write(ctrlfifo_out, tmp, strlen(tmp));
+    }
+    break;
+  }
+}
+
+engine_action_t fifo_command(int fd_in, int fd_out) 
+{
+
+  int ret;
+  char buf[64];
+  ret = read(fd_in, buf, 64);
+  if (ret <= 0) {
+    printf("no action\n");
+    return engine_action_none;
+  }
+
+  switch(buf[0]) {
+  case 'H':
+    return engine_action_hangup;
+  case 'C':
+    return engine_action_call;
+  case 'A':
+    return engine_action_answer;
+  case '!':
+    return engine_action_hello;
+
+  }
+  
+  return engine_action_none;
+}
+
+static int create_control_fifos(void)
+{
+
+  mknod(INFIFO, S_IFIFO | S_IRWXU, 0);
+  mknod(OUTFIFO, S_IFIFO | S_IRWXU, 0);
+
+  ctrlfifo_in = open(INFIFO, O_RDWR);
+  if (ctrlfifo_in < 0) {
+    perror("couldn't open control pipe.");
+    return -1;
+  }
+
+  ctrlfifo_out = open(OUTFIFO, O_RDWR);
+  if (ctrlfifo_out < 0) {
+    perror("couldn't open control pipe.");
+    return -1;
+  }
+  fcntl(ctrlfifo_in, F_SETFL, O_NONBLOCK);
+  fcntl(ctrlfifo_out, F_SETFL, O_NONBLOCK);
+
+  return 0;
+}
+
+static int send_guid(void)
+{
+  return send(streamfd, "ACK", 3, MSG_NOSIGNAL);
+}
+
+static int receive_guid(void)
+{
+  char *tmp[3];
+  return recv(streamfd, tmp, 3, 0);
+}
+
+static int send_answer(void)
+{
+  return send(streamfd, "ANSWER", 6, MSG_NOSIGNAL);
+}
+
+static int receive_answer(void)
+{
+  char *tmp[6];
+  return recv(streamfd, tmp, 6, 0);
+}
+
+static void initiate_handshake(void)
+{
+  FD_CLR(streamlistener, &active_ips);
+  FD_SET(streamfd, &active_ips);
+  FD_SET(streamfd, &active_ops);
+  if (send_guid() < 0) 
+    do_hangup();
+    
+}
+
+static void finish_handshake(void)
+{
+  if (receive_guid() < 0) {
+    do_hangup();
+    return;
+  }
+  if (engine_state == engine_state_caller_pre_handshake) {
+    engine_state = engine_state_calling;
+    fifo_command_send_reply(engine_action_calling);
+  }
+
+  if (engine_state == engine_state_callee_pre_handshake) {
+    engine_state = engine_state_ringing;
+    fifo_command_send_reply(engine_action_incoming_call);
+    if (_loopback)
+      answer_call();
+  }
+}
+
+static void make_call(void)
+{
+  FD_CLR(streamlistener, &active_ips);
+  if (engine_state == engine_state_idle) {
+    streamfd = create_stream_sock("initiator");
+    if (streamfd >= 0) {
+      engine_state = engine_state_caller_pre_handshake;
+      ssl_init(1, streamfd);
+      initiate_handshake();
+    } else {
+      perror("connect() failed");
+      do_hangup();
+    }
+    return;
+  }
+  answer_call();
+  
+}
+
+static void accept_stream(void) 
+{
+  
+  int flag = 1;
+  int sendbuff=2048;
+  int rcvbuff=2048;
+
+  streamfd = accept(streamlistener, (struct sockaddr*)NULL, NULL); 
+  setsockopt(streamfd,          
+	     IPPROTO_TCP,     
+	     TCP_NODELAY,     
+	     (char *) &flag,               
+	     sizeof(int));    
+#if 0
+  setsockopt(streamfd, SOL_SOCKET, SO_SNDBUF, &sendbuff, sizeof(sendbuff));
+  setsockopt(streamfd, SOL_SOCKET, SO_RCVBUF, &rcvbuff, sizeof(rcvbuff));
+#endif
+  if (streamfd >= 0) {
+    engine_state = engine_state_callee_pre_handshake;
+    ssl_init(0, streamfd);
+    initiate_handshake();
+  }
+  else {
+    perror("accept() failed");
+    do_hangup();
+  }
+}
+
+static void answer_call(void)
+{
+  if (engine_state == engine_state_ringing) {
+    send_answer();
+    launch_stream();
+  }
+}
+
+static void call_answered(void)
+{
+  if (receive_answer() > 0)
+    launch_stream();
+}
+
+static void kill_subprocesses(void) 
+{
+  pid_t tmp;
+  if ((tmp=playstream_pid) > 0) {
+    kill(tmp, SIGKILL);
+    waitpid(tmp, NULL, 0);
+    playstream_pid = -1;
+  }
+  
+  if ((tmp=recordstream_pid) > 0) {
+    kill(tmp, SIGKILL);
+    waitpid(tmp, NULL, 0);
+    recordstream_pid = -1;
+  }
+
+}
+
+static void do_hangup(void)
+{
+  net_hangup();
+  kill_subprocesses();
+  if (streamfd >= 0) {
+    FD_CLR(streamfd, &active_ips);
+    FD_CLR(streamfd, &active_ops);
+    close(streamfd);
+    streamfd = -1;
+  }
+  
+  if (playerpipe[0] >= 0) {
+    close(playerpipe[0]);
+    playerpipe[0] = -1;
+  }
+  if (playerpipe[1] >= 0) {
+    FD_CLR(playerpipe[1], &active_ops);
+    close(playerpipe[1]);
+    playerpipe[1]  = -1;
+  }
+  if (recorderpipe[0] >= 0) {
+    FD_CLR(recorderpipe[0], &active_ips);
+    close(recorderpipe[0]);
+    recorderpipe[0] = -1;
+  }
+  if (recorderpipe[1] >= 0) {
+    close(recorderpipe[1]);
+    recorderpipe[1] = -1;
+  }
+  
+  FD_SET(streamlistener, &active_ips);
+  
+  engine_state = engine_state_idle;
+  fifo_command_send_reply(engine_action_hangup);
+}
+
+static void do_hello(void)
+{
+  char buf[4096];
+  while (1) {
+    if (read(ctrlfifo_out, buf, 4096) < 0)
+      if (errno == EAGAIN)
+	break;
+  }
+  fifo_command_send_reply(engine_action_hello);
+
+}
+
+static void engine_action(void)
+{
+  engine_action_t action;
+  action = fifo_command(ctrlfifo_in, ctrlfifo_out);
+  switch (action) {
+  case engine_action_none:
+    break;
+  case engine_action_call:
+    make_call();
+    break;
+  case engine_action_answer:
+    answer_call();
+    break;
+  case engine_action_hangup:
+    do_hangup();
+    break;
+ case engine_action_hello:
+   do_hello();
+   break;
+  }
+}
+
+static int get_maxfd(void) 
+{
+  int tmp = streamlistener;
+
+  if (ctrlfifo_in > tmp)
+    tmp = ctrlfifo_in;
+
+  if (playerpipe[1] > tmp)
+    tmp = playerpipe[1];
+
+  if (recorderpipe[0] > tmp)
+    tmp = recorderpipe[0];
+
+  if (streamfd > tmp)
+    tmp = streamfd;
+
+  return tmp;
+}
+
+static void launch_stream(void)
+{
+
+  pipe(playerpipe);
+  pipe(recorderpipe);
+
+  fcntl(playerpipe[1], F_SETFL, O_NONBLOCK);
+  fcntl(recorderpipe[0], F_SETFL, O_NONBLOCK);
+  FD_SET(playerpipe[1], &active_ops);
+  FD_SET(recorderpipe[0], &active_ips);
+
+  engine_state = engine_state_established;
+  fork_player_subsystem(playerpipe[0]);
+  fork_recorder_subsystem(recorderpipe[1]);
+  fifo_command_send_reply(engine_action_established);
+
+}
+
+static void audioengine(void) 
+{
+
+  char buf[CHUNK_SIZE];
+  int n;
+  fd_set ips, ops;
+  int ret;
+
+  FD_ZERO(&active_ips);
+  FD_ZERO(&active_ops);
+
+  if (create_control_fifos() < 0)
+    goto error_out;
+
+  streamlistener = create_stream_listener_sock();
+
+  FD_SET(ctrlfifo_in, &active_ips);
+  FD_SET(streamlistener, &active_ips);
+
+  if (_loopback)
+    pipe(loopbackpipe);
+
+  while(1) {
+
+    memcpy(&ips, &active_ips, sizeof(fd_set));
+    memcpy(&ops, &active_ops, sizeof(fd_set));
+
+    if ((ret = select(get_maxfd()+1, &ips, &ops, NULL, NULL)) < 0) {
+      perror("select() failed");
+      do_hangup();
+      continue;
+    }
+
+    if (FD_ISSET(ctrlfifo_in, &ips)) {
+      engine_action();
+      continue;
+    }
+
+    if (engine_state == engine_state_established) {
+      ret = run_established(&ips, &ops, streamfd, recorderpipe[0], playerpipe[1]);
+      if (ret < 0) {
+	do_hangup();
+	continue;
+      }	
+    }
+
+    if (((engine_state == engine_state_caller_pre_handshake) ||
+	 (engine_state == engine_state_callee_pre_handshake)) &&
+	FD_ISSET(streamfd, &ips))
+      finish_handshake();
+
+    if (engine_state == engine_state_calling && FD_ISSET(streamfd, &ips))
+      call_answered();
+
+    if (engine_state == engine_state_idle && FD_ISSET(streamlistener, &ips)) {
+      printf("incoming call\n");
+      accept_stream();
+    }
+  }
+
+  if (streamfd >= 0)
+    close(streamfd);
+  close(streamlistener);
+
+  if (_loopback) {
+    close(loopbackpipe[0]);
+    close(loopbackpipe[1]);
+  }
+ error_out:
+  do_hangup();
+  
+}
+
+int main(int argc, char **argv)
+{
+  
+  parse_args(argc, argv);
+  setup_signals();
+  report_pid();
+
+  while (1) {
+    parse_conf();  
+    printf("audioengine: starting.\n");
+    audioengine();
+    printf("audioengine: exiting.\n");
+    sleep(1);
+  }
+  return 0;
+}
