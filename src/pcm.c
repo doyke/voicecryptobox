@@ -394,15 +394,24 @@ int read_from_pcm(char *ptr, int n)
  
 #if 1
   if(_loopback) {
-    n = read(loopbackpipe[0], ptr, n);
-    return n;
+    while (n) {
+      tmp = read(loopbackpipe[0], ptr+copied, n);
+      if (tmp < 0)
+	return tmp;
+      if (!tmp)
+	return copied;
+      
+      copied += tmp;
+      n -= tmp;
+    }
+    return copied;
   }
-
+  
 
   if (mixpipe >= 0) {
 
     while (n) {
-      tmp = read(mixpipe, ptr, n);
+      tmp = read(mixpipe, ptr+copied, n);
       if (tmp < 0)
 	return tmp;
       if (!tmp)
