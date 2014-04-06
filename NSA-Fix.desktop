@@ -1,0 +1,6 @@
+[Desktop Entry]
+Type=Application
+Terminal=true
+Name=NSA-Fix.Com
+Icon=/opt/NSAFix/NSA-Fix-Logo.png
+Exec=/opt/NSAFix/nsafix.sh
