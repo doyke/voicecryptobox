@@ -51,6 +51,7 @@ typedef struct _hub_peer_t {
 struct list_head peerlist;
 extern hub_peer_t *conference_peer;
 
+void remove_dup_peers(const hub_peer_t *hp);
 hub_peer_t *find_peer(const char *cn);
 hub_peer_t *find_peer_by_nonse(const char *nonse);
 hub_peer_t *add_peer(int fd, peer_type_t type, const char *cn);

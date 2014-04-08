@@ -52,6 +52,26 @@ hub_peer_t *find_peer_by_nonse(const char *nonse)
   return ret;
 }
 
+void remove_dup_peers(const hub_peer_t *p)
+{
+
+  struct list_head *pos;
+  hub_peer_t *hp, *ret = NULL;
+
+  do {
+    list_for_each(pos, &peerlist) {
+      hp = (hub_peer_t *)pos;
+      if (!strcmp(hp->common_name, p->common_name) &&
+	  hp != p) {
+	ret = hp;
+	break;
+      }
+    }
+    if (ret)
+      peer_hangup(ret);
+  } while (ret);
+}
+
 hub_peer_t *add_peer(int fd, peer_type_t type, const char *cn)
 {
 

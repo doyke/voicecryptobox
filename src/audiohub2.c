@@ -265,6 +265,7 @@ static void accept_peer_control(void)
       return;
     }
   }
+  remove_dup_peers(hp);
   n = get_nonse(hp->nonse);
   if (hubnet_ctrl_write(hp, hp->nonse, n) < 0) {
     peer_hangup(hp);
