@@ -56,9 +56,10 @@ void remove_dup_peers(const hub_peer_t *p)
 {
 
   struct list_head *pos;
-  hub_peer_t *hp, *ret = NULL;
+  hub_peer_t *hp, *ret;
 
   do {
+    ret = NULL;
     list_for_each(pos, &peerlist) {
       hp = (hub_peer_t *)pos;
       if (!strcmp(hp->common_name, p->common_name) &&
