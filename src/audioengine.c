@@ -58,6 +58,8 @@ char saveropuscomp[8];
 char saveropusexpectloss[8];
 char loopback[8];
 int _loopback;
+char autoanswer[8];
+int _autoanswer;
 char llb[8];
 int _llb;
 char use_ssl[16];
@@ -350,6 +352,7 @@ static struct conf_opt conf_opts[] = {
   { "saveropuscomp", saveropuscomp, "1" },
   { "saveropusexpectloss", saveropusexpectloss, "0" },
   { "loopback", loopback, "false" },
+  { "autoanswer", autoanswer, "false" },
   { "llb", llb, "false" },
   { "ssl", use_ssl, "false" },
   { "certfile", certfile, "" },
@@ -418,6 +421,7 @@ static void parse_conf(void)
     _saveonly = 0;
 
   _loopback = !(strcmp(loopback, "true"));
+  _autoanswer = !(strcmp(autoanswer, "true"));
   _llb = !(strcmp(llb, "true"));
 
   _use_ssl = !strcmp(use_ssl, "true");
@@ -799,7 +803,7 @@ static void finish_handshake(void)
   if (engine_state == engine_state_callee_pre_handshake) {
     engine_state = engine_state_ringing;
     fifo_command_send_reply(engine_action_incoming_call);
-    if (_loopback)
+    if (_loopback || _autoanswer)
       answer_call();
   }
 
