@@ -405,7 +405,7 @@ int init_peer_conf_state(hub_peer_t *hp)
   return 0;
 }
 
-static void parse_call(hub_peer_t *hp, char *buf, int n)
+static int parse_call(hub_peer_t *hp, char *buf, int n)
 {
   hub_peer_t *other;
   int ret;
@@ -420,7 +420,7 @@ static void parse_call(hub_peer_t *hp, char *buf, int n)
     /* Calling to itself ? */
     if (!strcmp(hp->common_name, buf+1)) {
       peer_hangup(hp);
-      return;
+      return -1;
     }
     
     other = call_peer_name(hp, buf + 1);    
@@ -437,22 +437,25 @@ static void parse_call(hub_peer_t *hp, char *buf, int n)
 	free(ptr);
 	if (ret < 0) {
 	  peer_hangup(hp);
-	  return;
+	  return -1;
 	}
       }      
     }
-    else
-      return;
+    else {
+      peer_hangup(hp);
+      return -1;
+    }
   }
 
   hub_notify(NULL);
   FD_SET(hp->fd, &active_ops);
   FD_SET(other->fd, &active_ops);
+  return 0;
 }
 
 static int peer_control(hub_peer_t *hp)
 {
-  int n;
+  int n, ret = 0;
   memset(buf, 0, NETBUF_SIZE);
 
   n = hubnet_ctrl_read(hp, buf, NETBUF_SIZE-1);
@@ -462,11 +465,11 @@ static int peer_control(hub_peer_t *hp)
   }
   switch (buf[0]) {    
   case 'C':
-    parse_call(hp, buf+1, n-1);
+    ret = parse_call(hp, buf+1, n-1);
     break;
   }
       
-  return 0;
+  return ret;
 }
 
 static int route_p2p(hub_peer_t *hp1, hub_peer_t *hp2)
