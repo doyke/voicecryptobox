@@ -1,0 +1,21 @@
+#
+# exampleserver.cnf
+#
+
+[ req ]
+prompt                  = no
+distinguished_name      = server_distinguished_name
+req_extensions         = foo
+
+[ server_distinguished_name ]
+commonName              = bravo-1
+stateOrProvinceName     = foo6
+countryName             = fi
+emailAddress            = root@tradeshowhell.com
+organizationName        = My Organization Name
+organizationalUnitName  = Subunit of My Large Organization
+
+[foo]
+keyUsage		= digitalSignature,keyEncipherment,nonRepudiation
+extendedKeyUsage	= clientAuth,serverAuth
+nsCertType		= client,server
