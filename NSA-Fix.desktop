@@ -2,5 +2,5 @@
 Type=Application
 Terminal=true
 Name=NSA-Fix.Com
-Icon=/opt/NSAFix/NSA-Fix-Logo.png
-Exec=/opt/NSAFix/nsafix.sh
+Icon=/opt/alpha-1/NSA-Fix-Logo.png
+Exec=/opt/alpha-1/nsafix.sh
