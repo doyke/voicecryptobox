@@ -1,3 +1,29 @@
+<<<<<<< HEAD
 *.o
 autom4te.cache
 configure
+=======
+# Object files
+*.o
+*.ko
+*.obj
+*.elf
+
+# Libraries
+*.lib
+*.a
+
+# Shared objects (inc. Windows DLLs)
+*.dll
+*.so
+*.so.*
+*.dylib
+
+# Executables
+*.exe
+*.out
+*.app
+*.i*86
+*.x86_64
+*.hex
+>>>>>>> 94fb77a3e798d8e43f98f497735eeb4be72a8837
