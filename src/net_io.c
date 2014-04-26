@@ -38,6 +38,23 @@ SSL_CTX *ctx;
 SSL_CTX *control_ctx;
 char peer_CN[256];
 
+void net_configure_keepalive(int fd)
+{
+  /* Set the option active */
+  int optval = 1;
+  socklen_t optlen = sizeof(optval);
+  setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &optval, optlen);
+
+  int keepcnt = 7;
+  int keepidle = 30;
+  int keepintvl = 30;
+
+  setsockopt(fd, SOL_TCP, TCP_KEEPCNT, &keepcnt, sizeof(int));
+  setsockopt(fd, SOL_TCP, TCP_KEEPIDLE, &keepidle, sizeof(int));
+  setsockopt(fd, SOL_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(int));
+
+}
+
 int check_cert(SSL *ssl)
 {
   X509 *sslpeer;
@@ -309,7 +326,6 @@ int net_listen(void)
     int listenfd = 0, connfd = 0, ret;
 
     listenfd = socket(AF_INET, SOCK_STREAM, 0);
-
     int yes = 1;
     setsockopt(listenfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int));
     ret = bind(listenfd, (struct sockaddr*)&servaddr, sizeof(servaddr)); 
@@ -322,6 +338,7 @@ int net_listen(void)
     listen(listenfd, 10); 
 
     connfd = accept(listenfd, (struct sockaddr*)NULL, NULL); 
+
     close(listenfd);
     return connfd;
   }

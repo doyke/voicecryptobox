@@ -91,6 +91,23 @@ static int timeval_subtract (struct timeval *result,
   return x->tv_sec < y->tv_sec;
 }
 
+static void configure_keepalive(int fd)
+{
+  /* Set the option active */
+  int optval = 1;
+  socklen_t optlen = sizeof(optval);
+  setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &optval, optlen);
+
+  int keepcnt = 7;
+  int keepidle = 30;
+  int keepintvl = 30;
+
+  setsockopt(fd, SOL_TCP, TCP_KEEPCNT, &keepcnt, sizeof(int));
+  setsockopt(fd, SOL_TCP, TCP_KEEPIDLE, &keepidle, sizeof(int));
+  setsockopt(fd, SOL_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(int));
+
+}
+
 static int create_listener_sock(int control)
 {
   int ret, listenfd;
@@ -244,7 +261,8 @@ static void accept_peer_control(void)
     perror("accept() failed");
     return;
   }
-  
+  configure_keepalive(fd);
+
   if (peer_count() == MAX_PEERS) {
     FD_CLR(listener, &active_ips);
     FD_CLR(control_listener, &active_ips);
@@ -292,6 +310,8 @@ static void accept_peer(void)
     perror("accept() failed");
     return;
   }
+
+  configure_keepalive(fd);
   // TODO add timeout
   n = recv(fd, buf, NONSE_LENGTH, 0);
   if (n != NONSE_LENGTH) {

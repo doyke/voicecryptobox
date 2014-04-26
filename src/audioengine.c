@@ -149,6 +149,7 @@ char conffilename[PATH_MAX] = { CONF_FILE_NAME };
 #define FIFO_MAXARGS 256
 char fifoargs[FIFO_MAXARGS];
 
+extern void net_configure_keepalive(int fd);
 extern int net_control_read(int fd, char *buf, int n);
 extern int send_identity(int fd, char *identity);
 extern int send_nonse(int fd, char *buf, int n);
@@ -891,6 +892,7 @@ static void accept_stream(void)
       do_hangup();
       return;
     }
+    net_configure_keepalive(streamfd);
 #if 1
     setsockopt(streamfd, SOL_SOCKET, SO_SNDBUF, &sendbuff, sizeof(sendbuff));
     setsockopt(streamfd, SOL_SOCKET, SO_RCVBUF, &rcvbuff, sizeof(rcvbuff));
