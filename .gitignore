@@ -1,3 +1,6 @@
+*.o
+autom4te.cache
+configure
 # Object files
 *.o
 *.ko
